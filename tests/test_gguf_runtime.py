@@ -547,3 +547,27 @@ def test_library_references_survive_restart_and_are_not_limited_to_twelve(engine
         assert not restarted.references_prepared(references[1:])
     finally:
         restarted.close()
+
+
+def test_first_generation_uses_same_prefix_key_after_reference_encoding(engine, tmp_path, monkeypatch):
+    import wave
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("DRAMA_TEST_PROTOCOL", "5")
+    monkeypatch.delenv("DRAMA_GGUF_PREFIX_DISK", raising=False)
+    monkeypatch.setattr(runtime, "read_windows_memory_status", lambda: None)
+    engine.build.update(protocol=5, features=["reference_prefix_disk"])
+    engine.voice_library = tmp_path / "voices"
+    engine.voice_disk_cache = runtime.DiskVoiceCache(tmp_path / "prefix-test-cache", retain_free=0)
+    path = engine.voice_library / "role" / "reference.wav"
+    path.parent.mkdir(parents=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"\0\0" * 800)
+    reference = SimpleNamespace(audio=path, transcript=lambda: "Reference text.")
+
+    first = engine.generate("First line.", tmp_path / "first.wav", references=[reference])
+    second = engine.generate("Different line.", tmp_path / "second.wav", references=[reference])
+
+    assert (first["reference_codes_cached"], second["reference_codes_cached"]) == (0, 1)
+    assert first["request_echo"]["options"]["prefix_disk_key"] == second["request_echo"]["options"]["prefix_disk_key"]

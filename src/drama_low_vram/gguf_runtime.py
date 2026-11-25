@@ -482,8 +482,10 @@ class GGUFEngine:
         pending, limit = archive.plan_prefix(card, maximum=80 * MIB + self.context * 64 * 1024)
         if reader is None and pending is None:
             return {}, None, None
+        # Keep the same fingerprint whether codes were cached or encoded in this request.
+        encoded = [{"vq_codes": entry["vq_codes"], "text": entry["text"]} for entry in descriptors]
         # Resource/prefill geometry can select different numerical kernels.
-        fingerprint = voice_cache_identity("gguf-native-prefix-v1", card, descriptors, self.selected_device,
+        fingerprint = voice_cache_identity("gguf-native-prefix-v1", card, encoded, self.selected_device,
                                            self.plan.cache_experts, self.prefill_width or self.plan.prefill_work_width)
         options = {"prefix_disk_key": fingerprint}
         if reader is not None:
