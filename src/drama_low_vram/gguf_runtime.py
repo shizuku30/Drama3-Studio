@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import replace
+from functools import lru_cache
 import json
 import hashlib
 import os
@@ -30,10 +31,12 @@ from .gguf_resources import Layout, plan_resources
 from .memory_status import read_windows_memory_status
 from .runtime_files import load_native_runtime
 from .nvidia_policy import policy_for
+from .voice_disk_cache import DiskVoiceCache, MIB, voice_cache_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 PREFIX = "@drama3 "
 MAX_AUTOMATIC_CONTEXT = 8192
+REFERENCE_SIDECAR_LIMIT = 1024**2
 DIAGNOSTICS = (
     "DRAMA_Q8_ROUTE_TRACE", "DRAMA_Q8_ROUTE_TRACE_REQUEST", "DRAMA_Q8_STEP_RECORD",
     "DRAMA_Q8_STEP_REPLAY", "DRAMA_Q8_RAW_CPU", "DRAMA_Q8_COMPATIBLE_QUANT",
@@ -125,8 +128,15 @@ def reference_wav(path, root=ROOT):
 
 
 def reference_content_key(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    return _reference_content_digest(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+@lru_cache(maxsize=512)
+def _reference_content_digest(path, size, mtime, ctime):
     digest = hashlib.sha256(b"gguf-reference-codes-v1")
-    with Path(path).open("rb") as file:
+    with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024**2), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -138,10 +148,16 @@ class GGUFEngine:
     is_gguf = True
 
     def __init__(self, model, *, root=ROOT, context=1024, storage="auto", cache=None, plan=None,
-                 pipeline_width=0, pipeline_serial=False, prefill_width=None, decoder="auto", device=None):
+                 pipeline_width=0, pipeline_serial=False, prefill_width=None, decoder="auto", device=None,
+                 voice_library=None, voice_cache_dir=None, auto_cache_limit=64):
         self.root = Path(root).resolve()
         self.model_path = Path(model).resolve()
+        self.voice_library = Path(voice_library).resolve() if voice_library is not None else None
+        self.voice_disk_cache = (
+            DiskVoiceCache(voice_cache_dir if voice_cache_dir is not None else self.root / ".cache/voice-cache")
+            if self.voice_library is not None else None)
         self.context, self.storage, self.cache = context, storage, cache
+        self.auto_cache_limit = auto_cache_limit
         if decoder not in ("auto", "cpu", "cuda"):
             raise ValueError("Decoder must be auto, cpu or cuda")
         self.decoder = decoder
@@ -271,7 +287,8 @@ class GGUFEngine:
                     available_ram=host.ram_available_bytes if host is not None else psutil.virtual_memory().available,
                     commit_available=host.commit_available_bytes if host is not None else None,
                     cores=psutil.cpu_count(logical=False), context=self.context,
-                    storage=self.storage, cache=self.cache, decoder=self.decoder)
+                    storage=self.storage, cache=self.cache, decoder=self.decoder,
+                    auto_cache_limit=self.auto_cache_limit)
             self._reuse_fallback = False
             self._identity = signature
             candidates = [self.plan, *self.plan.fallbacks()]
@@ -353,10 +370,43 @@ class GGUFEngine:
         finally:
             self._event(stage="timing", timing_phase="initialization", timing_action="end")
 
-    def _remember_reference_codes(self, audio_path, artifact):
+    def _model_identity(self):
         model = self.model_path.stat()
-        key = (str(self.model_path), model.st_size, model.st_mtime_ns,
-               reference_content_key(audio_path))
+        return (str(self.model_path), model.st_size, model.st_mtime_ns, model.st_ctime_ns, self.build.get("sha256"))
+
+    def _library_clip(self, audio_path):
+        if self.voice_library is None:
+            return None
+        path = Path(audio_path).resolve()
+        if not path.is_relative_to(self.voice_library):
+            return None
+        clip = path.relative_to(self.voice_library)
+        return clip if len(clip.parts) >= 2 else None
+
+    def _card_cache_key(self, clip):
+        return voice_cache_identity("gguf-role-card-v1", *self._model_identity(), clip.parts[0])
+
+    def _reference_key(self, audio_path):
+        clip = self._library_clip(audio_path)
+        # Preserve the legacy fingerprint for optional one-time imports.
+        old_name = str(clip.with_name(clip.name + ".gguf-codes.json")) if clip is not None else None
+        return (*self._model_identity(), old_name, reference_content_key(audio_path))
+
+    @staticmethod
+    def _reference_sidecar_key(key):
+        return hashlib.sha256(json.dumps(["gguf-reference-sidecar-v1", *key]).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _valid_reference_codes(codes):
+        if not isinstance(codes, list) or len(codes) != 10 or not isinstance(codes[0], list):
+            return False
+        frames = len(codes[0])
+        return 0 < frames <= 4096 and all(
+            isinstance(book, list) and len(book) == frames
+            and all(type(code) is int and 0 <= code < (4096 if index == 0 else 1024) for code in book)
+            for index, book in enumerate(codes))
+
+    def _cache_reference_codes(self, key, artifact):
         value = json.dumps(artifact, ensure_ascii=False, separators=(",", ":"))
         size = len(value.encode("utf-8"))
         if size > self._reference_codes_budget:
@@ -371,24 +421,80 @@ class GGUFEngine:
             self._reference_codes[key] = (value, size)
             self._reference_codes_bytes += size
 
-    def _cached_reference_codes(self, path):
-        model = self.model_path.stat()
-        key = (str(self.model_path), model.st_size, model.st_mtime_ns,
-               reference_content_key(path))
+    def _remember_reference_codes(self, audio_path, artifact, *, encoded_key=None):
+        key = self._reference_key(audio_path)
+        if encoded_key is not None and key != encoded_key:
+            return
+        clip = self._library_clip(audio_path)
+        if clip is not None and self.voice_disk_cache.write_codes(
+                self._card_cache_key(clip), clip.as_posix(), key[-1], artifact["vq_codes"]):
+            return
+        # Unregistered recordings or a write failure can still reuse the bounded process cache.
+        self._cache_reference_codes(key, artifact)
+
+    def _cached_reference_codes(self, path, *, key=None):
+        key = key if key is not None else self._reference_key(path)
         with self._reference_codes_lock:
             value = self._reference_codes.get(key)
-            if value is None:
-                return None
-            self._reference_codes.move_to_end(key)
-            return json.loads(value[0])
+            if value is not None:
+                self._reference_codes.move_to_end(key)
+                return json.loads(value[0])
+        clip = self._library_clip(path)
+        if clip is None:
+            return None
+        archive = self.voice_disk_cache
+        card_key = self._card_cache_key(clip)
+        codes = archive.read_codes(card_key, clip.as_posix(), key[-1])
+        if self._valid_reference_codes(codes):
+            return {"vq_codes": codes}
+        # Older installations placed codec sidecars beside the original WAV. Import them
+        # lazily; never write or evict data from the library directory here.
+        source = self.voice_library / clip.with_name(clip.name + ".gguf-codes.json")
+        try:
+            with source.open("rb") as file:
+                raw = file.read(REFERENCE_SIDECAR_LIMIT + 1)
+            if len(raw) <= REFERENCE_SIDECAR_LIMIT:
+                data = json.loads(raw)
+                if (isinstance(data, dict) and data.get("key") == self._reference_sidecar_key(key)
+                        and self._valid_reference_codes(data.get("vq_codes"))):
+                    codes = data["vq_codes"]
+                    archive.write_codes(card_key, clip.as_posix(), key[-1], codes)
+                    return {"vq_codes": codes}
+        except (OSError, ValueError, RecursionError):
+            pass
+        return None
+
+    def _prefix_disk_options(self, references, descriptors):
+        if (not references or "reference_prefix_disk" not in self.build.get("features", ())
+                or os.environ.get("DRAMA_GGUF_PREFIX_DISK") == "0"):
+            return {}, None, None
+        clips = [self._library_clip(reference.audio) for reference in references]
+        if clips[0] is None or any(clip is None or clip.parts[0] != clips[0].parts[0] for clip in clips):
+            return {}, None, None
+        if not all("vq_codes" in entry for entry in descriptors):
+            return {}, None, None
+        host = read_windows_memory_status()
+        if host is not None and min(host.ram_available_bytes, host.commit_available_bytes) < 256 * MIB:
+            return {}, None, None
+        card = self._card_cache_key(clips[0])
+        archive = self.voice_disk_cache
+        reader = archive.read_prefix(card)
+        pending, limit = archive.plan_prefix(card, maximum=80 * MIB + self.context * 64 * 1024)
+        if reader is None and pending is None:
+            return {}, None, None
+        # Resource/prefill geometry can select different numerical kernels.
+        fingerprint = voice_cache_identity("gguf-native-prefix-v1", card, descriptors, self.selected_device,
+                                           self.plan.cache_experts, self.prefill_width or self.plan.prefill_work_width)
+        options = {"prefix_disk_key": fingerprint}
+        if reader is not None:
+            options["prefix_disk_read"] = str(reader)
+        if pending is not None:
+            options["prefix_disk_write"] = str(pending)
+            options["prefix_disk_limit"] = str(limit)
+        return options, card, pending
 
     def references_prepared(self, references):
-        paths = [Path(reference.audio).resolve() for reference in references]
-        model = self.model_path.stat()
-        prefix = (str(self.model_path), model.st_size, model.st_mtime_ns)
-        keys = [(*prefix, reference_content_key(path)) for path in paths]
-        with self._reference_codes_lock:
-            return bool(keys) and all(key in self._reference_codes for key in keys)
+        return bool(references) and all(self._cached_reference_codes(ref.audio) is not None for ref in references)
 
     def prewarm_references(self, references, *, cancelled=None):
         """Encode reference audio in the resident worker without generating speech."""
@@ -396,18 +502,28 @@ class GGUFEngine:
             raise RuntimeError("Update the native runtime to protocol 5 for reference prewarming")
         if not references or len(references) > 32:
             raise ValueError("Reference prewarming requires 1..32 audio clips")
-        descriptors, audio_paths = [], []
-        import soundfile as sf
+        descriptors, pending = [], []
+        started = time.perf_counter()
         for reference in references:
+            if cancelled is not None and cancelled():
+                raise GenerationCancelled("GGUF reference preparation cancelled")
             path = Path(reference.audio).resolve()
             if not path.is_file() or path.stat().st_size > 128 * 1024**2:
                 raise ValueError("Reference audio is missing or exceeds 128 MiB")
+            transcript = reference.transcript()
+            key = self._reference_key(path)
+            if self._cached_reference_codes(path, key=key) is not None:
+                continue
+            import soundfile as sf
             audio_path = reference_wav(path, self.root)
             info = sf.info(str(audio_path))
             if info.duration <= 0 or info.duration > 120:
                 raise ValueError("Reference audio must have a duration between zero and 120 seconds")
-            descriptors.append({"audio_path": str(audio_path), "text": reference.transcript()})
-            audio_paths.append(path)
+            descriptors.append({"audio_path": str(audio_path), "text": transcript})
+            pending.append((path, key, transcript))
+        if not pending:
+            return {"status": "ready", "references": len(references), "encoded": 0,
+                    "request_seconds": time.perf_counter() - started, "session_reused": self.loaded}
 
         request = {
             "text": "Reference preparation only.",
@@ -434,22 +550,20 @@ class GGUFEngine:
                 response = self._receive(cancelled=cancelled, request_id=identifier)
                 prepared = response.get("references")
                 if (response.get("event") != "prewarmed" or not isinstance(prepared, list)
-                        or len(prepared) != len(references)):
+                        or len(prepared) != len(pending)):
                     raise NativeFailure("Invalid native reference preparation response")
-                for path, reference, artifact_json in zip(audio_paths, references, prepared):
+                for (path, key, transcript), artifact_json in zip(pending, prepared):
                     try:
                         artifact = json.loads(artifact_json)
                     except (TypeError, ValueError) as error:
                         raise NativeFailure("Native reference preparation returned invalid codes") from error
-                    if (not isinstance(artifact, dict)
-                            or artifact.get("text") != reference.transcript()
-                            or not isinstance(artifact.get("vq_codes"), list)
-                            or len(artifact["vq_codes"]) != 10):
+                    if (not isinstance(artifact, dict) or artifact.get("text") != transcript
+                            or not self._valid_reference_codes(artifact.get("vq_codes"))):
                         raise NativeFailure("Native reference preparation returned invalid codes")
-                    self._remember_reference_codes(path, artifact)
+                    self._remember_reference_codes(path, artifact, encoded_key=key)
                 self._count += 1
                 return {
-                    "status": "ready", "references": len(references),
+                    "status": "ready", "references": len(references), "encoded": len(pending),
                     "request_seconds": time.perf_counter() - started,
                     "session_reused": reused,
                 }
@@ -464,7 +578,7 @@ class GGUFEngine:
                  temperature=1.0, top_k=DEFAULT_TOP_K, top_p=0.9, chunk_size=160, cancelled=None,
                  previous_takes=(), direction="", language=None, duration_frames=None,
                  task_mode="", lookahead="", infill=None, streaming_audio=False,
-                 chunk_frames=16, segment_ready=None, design=None):
+                 chunk_frames=16, segment_ready=None, design=None, cache_prefix=True):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Provide nonempty speech text")
         if (any(isinstance(value, bool) or not isinstance(value, int)
@@ -537,26 +651,30 @@ class GGUFEngine:
                 raise ValueError("Reference audio does not exist")
             if path.stat().st_size > 128 * 1024**2:
                 raise ValueError("Reference audio exceeds 128 MiB; provide a shorter reference")
+            transcript = reference.transcript()
+            cached = self._cached_reference_codes(path)
+            if cached is not None:
+                descriptors.append({"vq_codes": cached["vq_codes"], "text": transcript})
+                continue
             audio_path = reference_wav(path, self.root)
             import soundfile as sf
             info = sf.info(str(audio_path))
             if info.duration <= 0 or info.duration > 120:
                 raise ValueError("Reference audio must have a duration between zero and 120 seconds")
-            cached = self._cached_reference_codes(path)
-            descriptors.append(
-                {"vq_codes": cached["vq_codes"], "text": reference.transcript()}
-                if cached else {"audio_path": str(audio_path), "text": reference.transcript()})
+            descriptors.append({"audio_path": str(audio_path), "text": transcript})
+        cached_references = sum("vq_codes" in descriptor for descriptor in descriptors)
         if descriptors:
             request["options"]["references"] = json.dumps(descriptors, ensure_ascii=False)
         with self._lock:
             self.load(cancelled=cancelled)
-            if (len(references) > 1 and self.build.get("protocol", 1) >= 5
-                    and any("audio_path" in descriptor for descriptor in descriptors)):
+            if self.build.get("protocol", 1) >= 5 and cached_references < len(descriptors):
                 missing = [
                     reference for reference, descriptor in zip(references, descriptors)
                     if "audio_path" in descriptor
+                    and (len(references) > 1 or self._library_clip(reference.audio) is not None)
                 ]
-                self.prewarm_references(missing, cancelled=cancelled)
+                if missing:
+                    self.prewarm_references(missing, cancelled=cancelled)
                 for reference, descriptor in zip(references, descriptors):
                     if "audio_path" not in descriptor:
                         continue
@@ -573,7 +691,11 @@ class GGUFEngine:
             attempt_limit = 3 + len(list(self.plan.fallbacks()))
             for retry in range(attempt_limit):
                 identifier = uuid.uuid4().hex
-                envelope = {"id": identifier, "output": str(output), "request": request,
+                prefix_options, card, pending = ({}, None, None)
+                if cache_prefix and not task_mode and not previous_takes and not design:
+                    prefix_options, card, pending = self._prefix_disk_options(references, descriptors)
+                active_request = request | {"options": request["options"] | prefix_options}
+                envelope = {"id": identifier, "output": str(output), "request": active_request,
                             "streaming": streaming_audio, "chunk_frames": chunk_frames}
                 segments, delivered_samples = [], 0
                 started = time.perf_counter()
@@ -629,6 +751,7 @@ class GGUFEngine:
                         "device": self.selected_device,
                         "hardware_policy": self.hardware_policy.report() if self.hardware_policy else None,
                         "session_reused": reused, "load_seconds": self.load_seconds,
+                        "reference_codes_cached": cached_references, "reference_count": len(descriptors),
                         "context_resizes": context_resizes,
                         "client_request_seconds": time.perf_counter() - started,
                         "resource_plan": self.plan.report(), "load_attempts": self.attempts,
@@ -655,6 +778,14 @@ class GGUFEngine:
                             raise NativeFailure("Native result did not produce the requested codec take")
                         if streaming_audio and delivered_samples != info.frames:
                             raise NativeFailure("Streamed samples do not match the final WAV length")
+                    if card is not None:
+                        archive = self.voice_disk_cache
+                        hit = timings.get("drama3.prefix_disk_hit") == 1
+                        if hit:
+                            archive.touch_prefix(card)
+                        saved = bool(pending is not None and timings.get("drama3.prefix_disk_saved") == 1
+                                     and archive.publish_prefix(card, pending))
+                        result["prefix_cache"] = {"hit": hit, "saved": saved}
                     output.with_suffix(".json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                                                            encoding="utf-8")
                     return result
@@ -703,6 +834,8 @@ class GGUFEngine:
                     self.close()
                     raise
                 finally:
+                    if pending is not None:
+                        self.voice_disk_cache.discard(pending)
                     self._busy = False
 
     def close(self):

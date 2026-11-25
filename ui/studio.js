@@ -588,7 +588,8 @@
     }
   }
   function afterResults(job, box) {
-    if (job.status !== 'complete' || !job.output || box.dataset.autoplayJob === job.id) return;
+    if (job.status !== 'complete' || !job.output || box.dataset.autoplayJob === job.id
+        || window.StudioPreview.ownsFinal(job.id)) return;
     box.dataset.autoplayJob = job.id;
     if ($('autoplay-audio').checked) box.querySelector('.main-result audio')?.play().catch(() => {});
   }
@@ -974,6 +975,8 @@
     const autoplay = input('autoplay-audio', '', 'checkbox');
     const autoplayLabel = node('label', 'check-field'); autoplayLabel.append(autoplay, node('span', '', t('Autoplay generated audio')));
     autoplayLabel.lastChild.dataset.i18n = 'Autoplay generated audio';
+    autoplayLabel.dataset.i18nTitle = 'Start playback as audio becomes available. Silence retry plays verified text chunks.';
+    autoplayLabel.title = t(autoplayLabel.dataset.i18nTitle);
     $('advanced-settings').querySelector('.advanced-content').append(silenceRetry, autoplayLabel);
     const diff = node('div', 'transcript-diff'); diff.id = 'transcript-diff'; diff.hidden = true;
     $('text').closest('.editor-area').after(diff);
@@ -1024,6 +1027,11 @@
       }
       clearCloneAudio(); clearExtraReferences();
       state.selectedVoiceIds.clear(); state.selectedVoiceIds.add(identifier);
+      const direction = $('direction');
+      if (!direction.value.trim() || direction.value === direction.dataset.cardPreset) {
+        direction.value = voiceById(identifier)?.direction_preset || '';
+        direction.dataset.cardPreset = direction.value;
+      } else delete direction.dataset.cardPreset;
       updateVoiceSelection(); updateMode(); updateEditorMeta(); renderOperation();
       view('generate'); $('saved-voice-options').open = false; saveSoon();
       window.ReferencePrewarm?.schedule();
@@ -1176,12 +1184,26 @@
     const references = await singleBindings();
     if (!references.length) throw new Error(t('Choose an audio file.'));
     const dialog = makeDialog('Save voice'), name = input('prepared-voice-name');
-    dialog.body.append(field('Name', name), localized('p', 'field-help', '{count} reference clips', { count: references.length }));
+    const preset = input('prepared-voice-direction'); preset.maxLength = 1000;
+    dialog.body.append(field('Name', name), field('Direction preset', preset),
+      localized('p', 'field-help', '{count} reference clips', { count: references.length }));
     dialog.footer.append(command('Save voice', () => guarded(async () => {
-      await post('/api/voices/from-references', { name: name.value, references });
+      await post('/api/voices/from-references', { name: name.value, references, direction_preset: preset.value });
       await loadVoices(); dialog.close();
     }), 'primary-btn')); dialog.show();
   }
+  function editVoiceCard(voice) {
+    const dialog = makeDialog('Edit voice card');
+    const name = input('edit-voice-name', voice.name);
+    const preset = input('edit-voice-direction', voice.direction_preset || ''); preset.maxLength = 1000;
+    dialog.body.append(field('Name', name), field('Direction preset', preset));
+    dialog.footer.append(command('Save voice', () => guarded(async () => {
+      await post('/api/voices/update', { voice_id: voice.id, name: name.value, direction_preset: preset.value });
+      await loadVoices(); dialog.close();
+    }), 'primary-btn'));
+    dialog.show();
+  }
+
   function configureVoiceLibrary() {
     const form = $('voice-form'), legacy = node('div', 'hidden');
     const dialog = $('voice-library-dialog'), note = $('voice-form-note');
@@ -1196,8 +1218,9 @@
     for (const control of legacy.querySelectorAll('input,textarea')) {
       control.required = false; control.disabled = true;
     }
+    const preset = input('new-voice-direction'); preset.maxLength = 1000;
     const body = node('div', 'studio-dialog-body');
-    body.append(nameLabel, name, preparation, legacy); form.replaceChildren(body, footer);
+    body.append(nameLabel, name, field('Direction preset', preset), preparation, legacy); form.replaceChildren(body, footer);
     form.noValidate = true;
     name.value = flow.voiceDraft.name || '';
     let nameSource = '';
@@ -1258,7 +1281,8 @@
         if (!name.value.trim()) throw new Error(t('Voice name must not be empty'));
         const references = await ReferencePrep.readAll(original.main, 0);
         if (!references.length) throw new Error(t('Choose an audio file.'));
-        await post('/api/voices/from-references', { name: name.value, references });
+        await post('/api/voices/from-references', { name: name.value, references, direction_preset: preset.value });
+        preset.value = '';
         ReferencePrep.cancel(original.main);
         flow.voiceDraft = { main: ReferencePrep.fresh(), name: '', autoName: null };
         name.value = ''; renderVoiceDraft();
@@ -2046,7 +2070,7 @@
     lockText: () => flow.operation?.action === 'revision' && !flow.operation.legacy,
     lockVoice: () => Boolean(flow.operation && !flow.operation.legacy),
     prepareRequest, submitted, enhanceResult, enhanceSegment, afterResults,
-    useLibraryVoice, referenceChanged: saveSoon, referencePrewarmPayload,
+    useLibraryVoice, editVoiceCard, referenceChanged: saveSoon, referencePrewarmPayload,
     voicesChanged: () => {
       ReferencePrep.refreshLibraries();
       if ($('selected-reference-details')) renderLibraryReferences();

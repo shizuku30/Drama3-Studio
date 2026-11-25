@@ -1,0 +1,310 @@
+diff --git a/include/engine/community_models/fish_drama3/backbone.h b/include/engine/community_models/fish_drama3/backbone.h
+index 1868886f..8710a9b2 100644
+--- a/include/engine/community_models/fish_drama3/backbone.h
++++ b/include/engine/community_models/fish_drama3/backbone.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <functional>
++
+ #include "engine/framework/assets/tensor_source.h"
+ #include "engine/framework/core/execution_context.h"
+ 
+@@ -85,6 +87,9 @@ public:
+             int64_t steps) = 0;
+         virtual std::vector<float> run_embedding_step(const std::vector<float> & embedding) = 0;
+         virtual int64_t valid_steps() const noexcept = 0;
++        using StateVisitor = std::function<bool(ggml_tensor *, size_t)>;
++        virtual bool visit_prefix_state(int64_t rows, const StateVisitor & visitor) = 0;
++        virtual void set_prefix_position(int64_t rows) = 0;
+     };
+ 
+     std::unique_ptr<DecodeSession> create_decode_session(int64_t cache_steps);
+diff --git a/include/engine/community_models/fish_drama3/prompt.h b/include/engine/community_models/fish_drama3/prompt.h
+index 04854c86..048e7fe8 100644
+--- a/include/engine/community_models/fish_drama3/prompt.h
++++ b/include/engine/community_models/fish_drama3/prompt.h
+@@ -17,6 +17,8 @@ struct Drama3TaskPrompt {
+     std::string lookahead;
+     std::string character_name, voice_description, scene;
+     codecs::FishDacCodes prefix, suffix;
++    std::string prefix_disk_key, prefix_disk_read, prefix_disk_write;
++    uint64_t prefix_disk_limit = 0;
+ };
+ 
+ void validate_drama3_text(const std::string & text, const char * location);
+@@ -24,6 +26,6 @@ void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t codebook_
+ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
+     const Drama3TextTokenizer & tokenizer, const std::string & text,
+     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
+-    const Drama3TaskPrompt & task = {});
++    const Drama3TaskPrompt & task = {}, size_t * reference_prefix_rows = nullptr);
+ 
+ }  // namespace engine::models::fish_drama3
+diff --git a/src/community_models/fish_drama3/backbone.cpp b/src/community_models/fish_drama3/backbone.cpp
+index 2ff26b2b..ae01ed29 100644
+--- a/src/community_models/fish_drama3/backbone.cpp
++++ b/src/community_models/fish_drama3/backbone.cpp
+@@ -1733,6 +1733,26 @@ public:
+         return cache_steps_;
+     }
+ 
++    bool visit_prefix_state(int64_t rows, const Drama3BackboneDecoderRuntime::DecodeSession::StateVisitor & visitor) {
++        if (rows <= 0 || rows > cache_steps_) return false;
++        const auto visit_kv = [&](ggml_tensor * cache) {
++            // Runtime shape: [batch=1, sequence, KV heads, head_dim] in reverse GGML order.
++            return ggml_is_contiguous(cache) && cache->ne[2] == cache_steps_ && cache->ne[3] == 1 &&
++                   visitor(cache, static_cast<size_t>(rows) * cache->nb[2]);
++        };
++        for (auto * cache : full_key_caches_) if (!visit_kv(cache)) return false;
++        for (auto * cache : full_value_caches_) if (!visit_kv(cache)) return false;
++        for (auto * state : linear_conv_tails_)
++            if (!ggml_is_contiguous(state) || !visitor(state, ggml_nbytes(state))) return false;
++        for (auto * state : linear_recurrent_states_)
++            if (!ggml_is_contiguous(state) || !visitor(state, ggml_nbytes(state))) return false;
++        return true;
++    }
++
++    void set_prefix_position(int64_t rows) {
++        valid_steps_ = rows;
++    }
++
+     Drama3BackboneDecoderForwardResult prefill_embeddings(const std::vector<float> & embeddings, int64_t steps) {
+         if (steps <= 0 || static_cast<int64_t>(embeddings.size()) != steps * config_.hidden_size) {
+             throw std::runtime_error("Drama 3 backbone prefill embedding input size mismatch");
+@@ -2108,6 +2128,14 @@ public:
+         return graph_.get().valid_steps();
+     }
+ 
++    bool visit_prefix_state(int64_t rows, const StateVisitor & visitor) override {
++        return graph_.get().visit_prefix_state(rows, visitor);
++    }
++
++    void set_prefix_position(int64_t rows) override {
++        graph_.get().set_prefix_position(rows);
++    }
++
+ private:
+     std::reference_wrapper<Drama3BackboneCachedDecodeGraph> graph_;
+ };
+diff --git a/src/community_models/fish_drama3/generator.cpp b/src/community_models/fish_drama3/generator.cpp
+index 5f14e756..dfe0a18e 100644
+--- a/src/community_models/fish_drama3/generator.cpp
++++ b/src/community_models/fish_drama3/generator.cpp
+@@ -11,6 +11,9 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <filesystem>
++#include <fstream>
++#include "ggml-backend.h"
+ #include <iostream>
+ #include <numeric>
+ #include <random>
+@@ -19,6 +22,106 @@
+ namespace engine::models::fish_drama3 {
+ namespace {
+ 
++// The file is a versioned copy of tensor data, not device pointers or GGML graphs.
++// Reading and writing through a shared 1 MiB staging buffer keeps the disk tier bounded.
++constexpr uint64_t max_prefix_blob = 512ULL * 1024 * 1024;
++constexpr std::array<char, 8> prefix_magic = {'D','R','3','P','F','X','1','\0'};
++
++class PrefixFile {
++public:
++    PrefixFile(const std::filesystem::path & path, bool writing)
++        : stream_(path, std::ios::binary | (writing ? std::ios::out | std::ios::trunc : std::ios::in)),
++          writing_(writing) {}
++
++    bool transfer(void * data, size_t size) {
++        auto * bytes = static_cast<char *>(data);
++        if (writing_) stream_.write(bytes, static_cast<std::streamsize>(size));
++        else stream_.read(bytes, static_cast<std::streamsize>(size));
++        if (!stream_) return false;
++        for (size_t i = 0; i < size; ++i) {
++            checksum_ ^= static_cast<unsigned char>(bytes[i]);
++            checksum_ *= 1099511628211ULL;
++        }
++        return true;
++    }
++
++    bool complete() {
++        if (writing_) {
++            stream_.write(reinterpret_cast<const char *>(&checksum_), sizeof(checksum_));
++            stream_.flush();
++            return static_cast<bool>(stream_);
++        }
++        uint64_t check = 0;
++        stream_.read(reinterpret_cast<char *>(&check), sizeof(check));
++        return stream_ && check == checksum_ && stream_.peek() == std::char_traits<char>::eof();
++    }
++
++private:
++    std::fstream stream_;
++    bool writing_;
++    uint64_t checksum_ = 14695981039346656037ULL;
++};
++
++uint64_t prefix_blob_size(Drama3BackboneDecoderRuntime::DecodeSession & decoder,
++    size_t rows, size_t hidden_size) {
++    uint64_t size = prefix_magic.size() + 64 + 2 * sizeof(uint64_t) + sizeof(uint64_t)
++        + rows * (sizeof(Drama3Frame) + hidden_size * sizeof(float));
++    if (!decoder.visit_prefix_state(static_cast<int64_t>(rows), [&](ggml_tensor *, size_t bytes) {
++            if (bytes > max_prefix_blob || size > max_prefix_blob - bytes) return false;
++            size += bytes;
++            return true;
++        })) return 0;
++    return size;
++}
++
++bool transfer_prefix(const std::string & name, bool writing, const Drama3TaskPrompt & task,
++    const std::vector<Drama3Frame> & prompt, size_t rows, size_t hidden_size,
++    Drama3BackboneDecoderRuntime::DecodeSession & decoder, std::vector<float> & hidden) {
++    if (name.empty() || task.prefix_disk_key.size() != 64 || rows == 0 || rows > 8192) return false;
++    const auto size = prefix_blob_size(decoder, rows, hidden_size);
++    if (size == 0 || size > max_prefix_blob || (writing && size > task.prefix_disk_limit)) return false;
++    try {
++        const auto path = std::filesystem::u8path(name);
++        if (writing ? path.extension() != ".pending" : path.extension() != ".prefix") return false;
++        if (!writing) {
++            std::error_code error;
++            if (std::filesystem::file_size(path, error) != size || error) return false;
++        }
++        PrefixFile file(path, writing);
++        auto magic = prefix_magic;
++        auto fingerprint = task.prefix_disk_key;
++        uint64_t file_rows = rows, file_hidden = hidden_size;
++        if (!file.transfer(magic.data(), magic.size()) ||
++            !file.transfer(fingerprint.data(), fingerprint.size()) ||
++            !file.transfer(&file_rows, sizeof(file_rows)) ||
++            !file.transfer(&file_hidden, sizeof(file_hidden)) ||
++            magic != prefix_magic || fingerprint != task.prefix_disk_key ||
++            file_rows != rows || file_hidden != hidden_size) return false;
++        std::vector<Drama3Frame> frames(prompt.begin(), prompt.begin() + rows);
++        if (!file.transfer(frames.data(), frames.size() * sizeof(Drama3Frame)) ||
++            !std::equal(frames.begin(), frames.end(), prompt.begin())) return false;
++        if (!writing) hidden.resize(rows * hidden_size);
++        if (hidden.size() != rows * hidden_size || !file.transfer(hidden.data(), hidden.size() * sizeof(float)))
++            return false;
++        std::vector<char> staging(1024 * 1024);
++        if (!decoder.visit_prefix_state(static_cast<int64_t>(rows), [&](ggml_tensor * tensor, size_t bytes) {
++                for (size_t offset = 0; offset < bytes;) {
++                    const auto count = std::min(bytes - offset, staging.size());
++                    if (writing) ggml_backend_tensor_get(tensor, staging.data(), offset, count);
++                    if (!file.transfer(staging.data(), count)) return false;
++                    if (!writing) ggml_backend_tensor_set(tensor, staging.data(), offset, count);
++                    offset += count;
++                }
++                return true;
++            }) || !file.complete()) return false;
++        if (!writing) decoder.set_prefix_position(static_cast<int64_t>(rows));
++        return true;
++    } catch (const std::exception &) {
++        // A disposable file cannot prevent ordinary generation.
++        return false;
++    }
++}
++
+ int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
+                float top_p, std::mt19937 & random, int legal_count = -1) {
+     if (logits.empty()) throw std::runtime_error("Drama 3 sampler has no logits");
+@@ -240,7 +343,8 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
+         profile_marked = now;
+     };
+     if (task.mode == "infill" && streaming) throw runtime::InvalidRequestError("Infill requires complete reconstruction");
+-    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history, task);
++    size_t reference_rows = 0;
++    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history, task, &reference_rows);
+     if (sampling.max_frames > cache_steps_ ||
+         prompt.size() > static_cast<size_t>(cache_steps_ - sampling.max_frames)) {
+         throw runtime::CapacityError("Drama 3 prompt plus max_tokens exceeds fish_drama3.context_length; "
+@@ -249,7 +353,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
+     auto & decoder = decoder_;
+     // A continuation may extend the exact frames already evaluated. Never
+     // carry recurrent state across independent requests or changed histories.
+-    const size_t prefix_rows = disk_experts_ && continuation && !cached_prefix_.empty() &&
++    size_t prefix_rows = disk_experts_ && continuation && !cached_prefix_.empty() &&
+         cached_prefix_.size() <= prompt.size() && std::equal(cached_prefix_.begin(), cached_prefix_.end(), prompt.begin())
+         ? cached_prefix_.size() : 0;
+     auto prefix_hidden = std::move(cached_hidden_);
+@@ -270,6 +374,39 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
+     component_ms[1] += debug::elapsed_ms(component_started);
+     component_started = ProfileClock::now();
+     Drama3BackboneDecoderForwardResult prefill;
++    const auto width = static_cast<size_t>(assets_->backbone.hidden_size);
++    // The existing incremental suffix path is cheap for short utterances; retain
++    // batched full prefill for long scripts and unsupported modes.
++    const bool disk_eligible = prefix_rows == 0 && !continuation && task.mode.empty() &&
++        history.empty() && !references.empty() && reference_rows > 0 &&
++        prompt.size() > reference_rows && prompt.size() - reference_rows <= 128 &&
++        !task.prefix_disk_key.empty();
++    if (disk_eligible) {
++        const auto disk_started = ProfileClock::now();
++        bool restored = transfer_prefix(task.prefix_disk_read, false, task, prompt, reference_rows,
++                                        width, *decoder, prefix_hidden);
++        debug::timing_log_scalar("drama3.prefix_disk_hit", static_cast<int64_t>(restored));
++        debug::timing_log_scalar("drama3.prefix_disk_load_ms", debug::elapsed_ms(disk_started));
++        if (restored) {
++            prefix_rows = reference_rows;
++        } else {
++            // A partially read or corrupt snapshot must not leak into generation.
++            decoder->reset();
++            const auto bytes = prefix_blob_size(*decoder, reference_rows, width);
++            if (!task.prefix_disk_write.empty() && bytes > 0 && bytes <= task.prefix_disk_limit) {
++                const auto end = embeddings.begin() + reference_rows * width;
++                auto prefix = decoder->prefill_embeddings({embeddings.begin(), end},
++                                                           static_cast<int64_t>(reference_rows));
++                prefix_hidden = std::move(prefix.hidden);
++                const auto write_started = ProfileClock::now();
++                const bool saved = transfer_prefix(task.prefix_disk_write, true, task, prompt, reference_rows,
++                                                   width, *decoder, prefix_hidden);
++                if (saved) prefix_rows = reference_rows;
++                debug::timing_log_scalar("drama3.prefix_disk_saved", static_cast<int64_t>(saved));
++                debug::timing_log_scalar("drama3.prefix_disk_save_ms", debug::elapsed_ms(write_started));
++            }
++        }
++    }
+     if (prefix_rows != 0) {
+         prefill.hidden = std::move(prefix_hidden);
+         prefill.steps = static_cast<int64_t>(prompt.size());
+diff --git a/src/community_models/fish_drama3/prompt.cpp b/src/community_models/fish_drama3/prompt.cpp
+index 756dcbea..3db1af9f 100644
+--- a/src/community_models/fish_drama3/prompt.cpp
++++ b/src/community_models/fish_drama3/prompt.cpp
+@@ -76,7 +76,7 @@ void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t size) {
+ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
+     const Drama3TextTokenizer & tokenizer, const std::string & text,
+     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
+-    const Drama3TaskPrompt & task) {
++    const Drama3TaskPrompt & task, size_t * reference_prefix_rows) {
+     std::vector<Drama3Frame> frames;
+     const auto append_text = [&](const std::string & segment) {
+         for (const auto token : tokenizer.encode(segment)) {
+@@ -116,6 +116,7 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
+         append_codes(references[index].codes);
+     }
+     append_text("<|im_end|>\n");
++    if (reference_prefix_rows) *reference_prefix_rows = frames.size();
+     const auto user_turn = [&](const std::string & value, const std::optional<std::string> & lookahead) {
+         validate_drama3_text(value, "input");
+         append_text("<|im_start|>user\n");
+diff --git a/src/community_models/fish_drama3/session.cpp b/src/community_models/fish_drama3/session.cpp
+index 1fa31ec6..b6df54da 100644
+--- a/src/community_models/fish_drama3/session.cpp
++++ b/src/community_models/fish_drama3/session.cpp
+@@ -250,6 +250,15 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
+         task_prompt.suffix = slice(end, source.codes.frames);
+     } else if (!task_prompt.mode.empty() && task_prompt.mode != "joint")
+         throw runtime::InvalidRequestError("Unknown native task mode");
++    if (task_prompt.mode.empty() && history.empty() && !references.empty()) {
++        task_prompt.prefix_disk_key = runtime::find_option(effective.options, {"prefix_disk_key"}).value_or("");
++        task_prompt.prefix_disk_read = runtime::find_option(effective.options, {"prefix_disk_read"}).value_or("");
++        task_prompt.prefix_disk_write = runtime::find_option(effective.options, {"prefix_disk_write"}).value_or("");
++        if (!task_prompt.prefix_disk_write.empty()) {
++            const auto limit = runtime::parse_positive_i64_option(effective.options, {"prefix_disk_limit"}, 0);
++            task_prompt.prefix_disk_limit = static_cast<uint64_t>(limit);
++        }
++    }
+     const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 200);
+     const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
+     const auto chunks = task_prompt.mode.empty() ? runtime::chunk_text_request(effective, chunk_size, mode)

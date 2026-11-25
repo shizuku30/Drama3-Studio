@@ -78,6 +78,12 @@ Use reference audio with clear speech and a transcript that matches what is actu
 
 The default transcription model location is `checkpoints/Qwen3-ASR-0.6B-hf`. You can also set `DRAMA_ASR_MODEL_DIR` to a local model in the native Transformers format. ASR models do not appear in the speech generation model list.
 
+### Saved Voices and Preview Playback
+
+Saved voice cards keep the original reference clips, transcripts, name, and an optional direction preset. Mark **Keep ready** to prioritise a voice in the picker; the cards themselves are not subject to a count limit. Reference encodings and, with a compatible native worker, fixed reference prefixes are saved on demand to a separate disk cache. Only the selected prefix is restored. The default cache budget is 2 GiB; old prefix files are evicted first, without removing voice cards. On Windows the cache defaults to `%LOCALAPPDATA%/Drama3Studio/voice-cache`; use `DRAMA_GGUF_VOICE_CACHE_DIR` to set its base directory.
+
+Enable **Autoplay generated audio** in Generation settings to start playback as audio becomes available. With silence retry enabled, playback starts after the first verified text chunk. Turn off silence retry for frame-by-frame preview. The complete WAV is still available for download and editing.
+
 ### First Generation and Releasing Resources
 
 Opening the page or restoring a draft does not load the generation model. The model loads and prepares the voice reference when you first generate, so the first task usually takes longer. While the model remains loaded, Studio reuses its caches and can automatically warm up new references.

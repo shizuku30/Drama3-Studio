@@ -147,9 +147,10 @@
           </div>
           <aside class="panel monitor-panel">
             <div class="panel-head"><div class="panel-heading"><svg class="icon"><use href="#i-wave"/></svg><h2 data-i18n="Output">Output</h2></div><span class="badge" id="job-badge"><span data-i18n="IDLE">IDLE</span></span></div>
-            <div class="monitor-meta"><span id="job-title"><span data-i18n="Ready">Ready</span></span><button class="text-btn hidden" id="cancel-job" data-i18n="Cancel">Cancel</button></div>
+            <div class="monitor-meta"><span id="job-title"><span data-i18n="Ready">Ready</span></span><button class="text-btn hidden" id="cancel-job" data-i18n="Stop and release">Stop and release</button></div>
             <div class="progress-wrap"><div class="progress-track"><div id="progress-bar"></div></div><div class="progress-row" role="status"><span id="progress-stage"><span data-i18n="Waiting for a request">Waiting for a request</span></span><span id="progress-count"></span></div></div>
             <p id="result-error" class="studio-error" role="alert" hidden></p>
+            <div id="playback-preview" class="monitor-meta" hidden><span id="playback-preview-status" role="status"></span><button type="button" id="stop-playback-preview" class="text-btn" data-i18n="Stop preview">Stop preview</button></div>
             <div id="result-box" class="result-box hidden"></div>
             <div id="live-stream-controls" class="conditional hidden"><label class="field-label" for="live-stream-text" data-i18n="Next text chunk">Next text chunk</label><textarea id="live-stream-text" class="compact-input" placeholder="Append another line…" data-i18n-placeholder="Append another line…"></textarea><div class="stream-actions"><button id="push-stream" class="secondary-btn" data-i18n="Append text">Append text</button><button id="finish-stream" class="secondary-btn" data-i18n="Finish input">Finish input</button></div><p id="live-stream-status" class="field-help"></p></div>
             <div id="output-placeholder" class="output-placeholder"><div class="empty-state output-empty"><div class="empty-illustration"><svg class="icon"><use href="#i-headphones"/></svg></div><b data-i18n="No audio yet">No audio yet</b></div></div>
@@ -240,6 +241,7 @@
         <div id="voices-cleanup" class="cleanup-bar" hidden></div>
         <p id="voices-cleanup-note" class="cleanup-note" role="status" hidden></p>
         <div id="voice-list" class="voice-list"></div>
+        <p id="voice-cache-error" class="studio-error" role="alert" hidden></p>
         <div id="voice-search-empty" hidden></div>
       </section>
       <section class="view" id="view-takes">
@@ -404,6 +406,7 @@
   <script src="/assets/i18n.js"></script>
   <script src="/assets/controls.js"></script>
   <script src="/assets/player.js"></script>
+  <script src="/assets/preview-audio.js"></script>
   <script src="/assets/script-editor.js"></script>
   <script src="/assets/app.js"></script>
   <script src="/assets/cleanup.js"></script>

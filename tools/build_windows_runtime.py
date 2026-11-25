@@ -52,7 +52,22 @@ def main():
     metadata = json.loads((ROOT / "native/audio-cpp-runtime.json").read_text(encoding="utf-8"))
     if metadata["upstream"] != UPSTREAM_COMMIT or sha(patch) != metadata["sha256"]:
         raise RuntimeError("Pinned native source or patch checksum differs from its metadata")
-    ensure_checkout(source, "https://github.com/0xShug0/audio.cpp.git", UPSTREAM_COMMIT, patch)
+    prefix = ROOT / metadata["prefix_patch"]
+    if sha(prefix) != metadata["prefix_sha256"]:
+        raise RuntimeError("Voice prefix patch checksum differs from its metadata")
+    repository = "https://github.com/0xShug0/audio.cpp.git"
+    # Extra hunks can change a primary patch's surrounding context, so verify
+    # the extension's reverse application before re-running the two stages.
+    prepared = False
+    if (source / ".git").exists():
+        revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        if revision == UPSTREAM_COMMIT:
+            prepared = subprocess.run(["git", "-C", str(source), "apply", "--reverse", "--check", str(prefix)],
+                                      capture_output=True).returncode == 0
+    if not prepared:
+        ensure_checkout(source, repository, UPSTREAM_COMMIT, patch)
+        ensure_checkout(source, repository, UPSTREAM_COMMIT, prefix)
     build, output = args.build_dir.resolve(), args.output_dir.resolve()
     env, cmake, ninja, vs = windows_tools()
     bundled_cmake = ROOT / ".cache/toolchains/python/cmake/data/bin/cmake.exe"
@@ -118,9 +133,7 @@ def main():
             r"code=\[(compute_[0-9]+a?)\]", (build / "build.ninja").read_text(encoding="utf-8")))),
         "platform": "windows-x86_64", "cpu_requires_avx2": True,
         "cuda_version": "12.8", "protocol": 5,
-        "features": ["ordinary", "references", "previous_takes", "stream", "infill",
-                     "audio_stream", "design", "joint_dialogue", "reference_prewarm",
-                     "output_codec_prewarm"],
+        "features": metadata["features"],
         "files": {p.name: sha(p) for p in output.iterdir() if p.is_file() and p.suffix in (".dll", ".exe")},
         "scope": "Compiled targets, not a claim of physical testing on every architecture",
     }

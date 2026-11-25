@@ -499,3 +499,51 @@ def test_task_markers_and_unsupported_worker_are_rejected_before_loading(engine,
     with pytest.raises(RuntimeError, match="protocol 3"):
         engine.generate("Hello.", tmp_path / "bad.wav", task_mode="stream", lookahead="Next.")
     assert not engine.loaded
+
+
+def test_library_references_survive_restart_and_are_not_limited_to_twelve(engine, tmp_path, monkeypatch):
+    import wave
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("DRAMA_TEST_PROTOCOL", "5")
+    engine.build["protocol"] = 5
+    engine.voice_library = tmp_path / "voices"
+    engine.voice_disk_cache = runtime.DiskVoiceCache(tmp_path / ".cache/voice-cache", retain_free=0)
+    references = []
+    for index in range(15):
+        path = engine.voice_library / str(index) / "reference.wav"
+        path.parent.mkdir(parents=True)
+        with wave.open(str(path), "wb") as wav:
+            wav.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            wav.writeframes((index // 2).to_bytes(2, "little") * 800)
+        references.append(SimpleNamespace(audio=path, transcript=lambda: "Reference text."))
+    report = engine.prewarm_references(references)
+    assert report["encoded"] == 15
+    assert not list(engine.voice_library.glob("*/*.gguf-codes.json"))
+    assert len(list(engine.voice_disk_cache.root.glob("*.codes"))) == 15
+    engine.close()
+
+    restarted = runtime.GGUFEngine(
+        engine.model_path, root=tmp_path, plan=engine.plan, voice_library=engine.voice_library)
+    restarted.build["protocol"] = 5
+    try:
+        assert restarted.references_prepared(references)
+        assert restarted.prewarm_references(references)["encoded"] == 0
+        assert not restarted.loaded
+        restarted.prewarm_references = Mock(side_effect=AssertionError("A prepared voice was encoded again"))
+        monkeypatch.setattr(runtime, "reference_wav", Mock(side_effect=AssertionError("A prepared WAV was read again")))
+        pids = set()
+        for index, reference in enumerate([*references, references[0]]):
+            result = restarted.generate("New text.", tmp_path / f"switch-{index}.wav", references=[reference])
+            assert result["reference_codes_cached"] == 1 and result["reference_count"] == 1
+            descriptor, = json.loads(result["request_echo"]["options"]["references"])
+            assert "vq_codes" in descriptor and "audio_path" not in descriptor
+            pids.add(result["pid"])
+        assert len(pids) == 1
+        references[0].audio.write_bytes(b"changed audio of a different size")
+        assert not restarted.references_prepared(references[:1])
+        assert restarted.references_prepared(references[1:])
+        restarted.model_path.write_bytes(b"different model identity")
+        assert not restarted.references_prepared(references[1:])
+    finally:
+        restarted.close()

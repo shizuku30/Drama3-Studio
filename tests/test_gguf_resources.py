@@ -207,3 +207,17 @@ def test_optional_prefill_retention_shrinks_under_ram_pressure(available, retain
     assert plan.prefill_cache_mib == retained
     assert plan.session_options()["fish_drama3.backbone_prefill_cache_mb"] == str(retained)
     assert plan.session_options()["fish_drama3.tower_prefill_cache_mb"] == str(retained)
+
+
+def test_larger_automatic_expert_cache_leaves_headroom_and_respects_ram():
+    model = replace(layout(False), dense_bytes=5814 * MIB, expert_bytes=17280 * MIB,
+                    slot_bytes=int(67.5 * MIB))
+    options = dict(available_ram=8 * GIB, commit_available=6 * GIB, cores=8)
+    original = plan_resources(model, free_vram=22 * GIB, **options)
+    assert original.cache_experts == 64
+    expanded = plan_resources(model, free_vram=22 * GIB, auto_cache_limit=128, **options)
+    assert expanded.cache_experts == 128
+    assert expanded.resident_estimate_bytes + expanded.workspace_estimate_bytes <= 20 * GIB
+    assert expanded.host_storage == "mapped"
+    limited = plan_resources(model, free_vram=8 * GIB, auto_cache_limit=128, **options)
+    assert limited == plan_resources(model, free_vram=8 * GIB, **options)

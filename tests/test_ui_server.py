@@ -1116,3 +1116,107 @@ def test_take_inspection_recovers_transcript_and_duration_without_loading_weight
             state.inspect_take(str(tmp_path.parent / "outside.take.npz"))
     finally:
         state.shutdown()
+
+
+def test_voice_cards_have_no_count_limit_and_only_the_selected_card_is_prepared(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    monkeypatch.setattr(server, "load_native_runtime", lambda _: {"protocol": 5})
+    state = server.AppState()
+    executor = defer_workers(state)
+    model = tmp_path / "native.gguf"
+    model.touch()
+    state.checkpoint = model
+    ids = [
+        state.add_voice(f"Voice {index}", "Reference.", 0, "sample.wav", b"audio " * 12,
+                        direction_preset="Soft.")["id"]
+        for index in range(15)
+    ]
+    try:
+        for identifier in ids:
+            assert state.set_voice_cache(identifier, True)["keep_ready"]
+        assert not executor.calls and state._engine is None
+        edited = state.update_voice_card({"voice_id": ids[0], "name": "Renamed", "direction_preset": "Excited."})
+        original = Path(edited["audio_path"])
+        assert edited["transcript"] == "Reference." and original.read_bytes() == b"audio " * 12
+        reopened = server.AppState(data_root=state.data_root)
+        try:
+            assert {voice["id"] for voice in reopened.list_voices() if voice["keep_ready"]} == set(ids)
+            assert reopened._voice(ids[0])["direction_preset"] == "Excited."
+            assert not reopened._voice_cache_refresh
+        finally:
+            reopened.shutdown()
+
+        prepared = set()
+        engine = state._engine = SimpleNamespace(
+            is_gguf=True, loaded=True, build={"protocol": 5}, close=lambda: None,
+            references_prepared=lambda refs: all(ref.audio in prepared for ref in refs),
+            prewarm_references=lambda refs, **_: prepared.update(ref.audio for ref in refs),
+        )
+        state._jobs["foreground"] = {"status": "queued"}
+        try:
+            state._schedule_voice_cache()
+            assert not executor.calls
+        finally:
+            state._jobs.pop("foreground")
+        state._schedule_voice_cache()
+        run, args = executor.calls.pop()
+        assert run == state._fill_voice_cache
+        run(*args)
+        assert prepared == {state._voice(ids[-1])["audio_path"]} and state._engine is engine
+        assert state.start_reference_prewarm({"voice_ids": [ids[-1]]})["status"] == "ready"
+        assert not executor.calls
+    finally:
+        state.shutdown()
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_preview_parts_are_available_before_normal_tts_completes(tmp_path, monkeypatch, retry):
+    import shutil
+
+    from drama_low_vram.codec import write_wav
+
+    monkeypatch.setattr(server, "ROOT", tmp_path)
+    state = server.AppState()
+    executor = defer_workers(state)
+    state.checkpoint = tmp_path / "native.gguf"
+    state.checkpoint.touch()
+    calls = []
+    early = []
+
+    class Engine(NativeTestEngine):
+        def generate(self, text, output, *, streaming_audio, segment_ready, **kwargs):
+            assert streaming_audio is not retry
+            calls.append(text)
+            if len(calls) == 2:
+                early.append(state.preview_audio(job_id, 0, timeout=0))
+            result = self.complete(text, output)
+            write_wav(torch.full((4096,), 0.2), output)
+            if streaming_audio:
+                part = output.with_suffix(".part.wav")
+                shutil.copyfile(output, part)
+                segment_ready({"index": 0, "path": str(part), "samples": 4096, "sample_rate": 44100,
+                               "start_sample": 0, "end_sample": 4096})
+            return result
+
+    state._get_engine = lambda _: Engine()
+    try:
+        job_id = state.create_job({
+            "text": ("This is the first line with a natural pause. It is followed by the next phrase. " * 2).strip(),
+            "mode": "tts", "max_chunk_chars": 80, "preview_audio": True, "silence_retry": retry,
+        })
+        run, args = executor.calls.pop()
+        run(*args)
+        job = state.job(job_id)
+        assert job["status"] == "complete", job.get("error")
+        assert job["mode"] == job["recipe"]["mode"] == "tts" and job["take_file"]
+        assert len(calls) == 2 and len(early) == 1
+        assert early[0]["status"] == "running" and not early[0]["done"]
+        first, = early[0]["parts"]
+        assert first["index"] == 0 and first["start_sample"] == 0
+        delivered = state.preview_audio(job_id, 1, timeout=0)
+        second, = delivered["parts"]
+        assert second["start_sample"] == first["samples"] and second["index"] == 1
+        assert second["produced_at"] >= first["produced_at"] and delivered["done"]
+        assert first["samples"] + second["samples"] == job["result"]["audio"]["samples"]
+    finally:
+        state.shutdown()

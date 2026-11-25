@@ -14,7 +14,10 @@
     "design",
     "joint_dialogue",
     "reference_prewarm",
-    "output_codec_prewarm"
+    "output_codec_prewarm",
+    "reference_prefix_disk"
   ],
-  "preserves_expert_top8": true
+  "preserves_expert_top8": true,
+  "prefix_patch": "native/voice-prefix.patch",
+  "prefix_sha256": "fe6d8bdc9ef62347742ed4b2aba8836ca38080c9c0b75e5a5b709d3add9b3c84"
 }

@@ -220,13 +220,15 @@ class Plan:
 
 
 def plan_resources(layout, *, free_vram, available_ram, cores, context=1024, storage="auto", cache=None,
-                   decoder="auto", commit_available=None):
+                   decoder="auto", commit_available=None, auto_cache_limit=64):
     if free_vram <= 0 or available_ram <= 0:
         raise ValueError("Cannot plan without an available GPU/RAM memory snapshot")
     if context < 256 or context > 8192:
         raise ValueError("Service context must be between 256 and 8192")
     if storage not in ("auto", "mapped", "pin") or (cache is not None and not 8 <= cache <= layout.experts):
         raise ValueError("Invalid storage or cache setting")
+    if type(auto_cache_limit) is not int or not 8 <= auto_cache_limit <= 256:
+        raise ValueError("GGUF expert cache limit must be an integer from 8 to 256")
     if decoder not in ("auto", "cpu", "cuda"):
         raise ValueError("Invalid waveform decoder setting")
     if decoder == "cuda" and not layout.codec_cuda_supported:
@@ -257,15 +259,22 @@ def plan_resources(layout, *, free_vram, available_ram, cores, context=1024, sto
     if chosen_decoder == "cuda":
         workspace += decoder_workspace
     resident = base + (layout.decoder_bytes if chosen_decoder == "cuda" else 0)
-    slots = min(layout.experts, max(8, (free_vram - resident - workspace) // layout.slot_bytes))
-    # Prefill still scales with cache width; use a conservative temporary cap.
-    slots = min(slots, 64) if cache is None else cache
-    if resident + slots * layout.slot_bytes + workspace > free_vram:
+    vram_budget = free_vram
+    auto_cache_limit = min(auto_cache_limit, layout.experts)
+    if cache is None and auto_cache_limit > 64:
+        larger_cache = resident + workspace + 65 * layout.slot_bytes
+        if vram_budget - 2 * GIB >= larger_cache:
+            vram_budget -= 2 * GIB
+        else:
+            auto_cache_limit = 64
+    slots = min(layout.experts, max(8, (vram_budget - resident - workspace) // layout.slot_bytes))
+    slots = min(slots, auto_cache_limit) if cache is None else cache
+    if resident + slots * layout.slot_bytes + workspace > vram_budget:
         raise MemoryError("Requested expert cache exceeds current available VRAM estimate")
     # The native prefill workspace grows with its expert batching width. Budget
     # each extra lane against one model-specific expert slot, then widen only
     # from memory left over after resident weights, cache, and base workspaces.
-    prefill_headroom = max(0, free_vram - resident - slots * layout.slot_bytes - workspace)
+    prefill_headroom = max(0, vram_budget - resident - slots * layout.slot_bytes - workspace)
     prefill_width = min(slots, 8 + prefill_headroom // max(1, layout.slot_bytes))
     prefill_workspace = (prefill_width - 8) * layout.slot_bytes
     workspace += prefill_workspace
@@ -294,8 +303,10 @@ def plan_resources(layout, *, free_vram, available_ram, cores, context=1024, sto
         notes.append("Automatic CUDA codec disabled: " + layout.codec_note)
     elif chosen_decoder == "cpu":
         notes.append("CPU waveform decoding selected by request or current available VRAM budget.")
-    if slots == 64 and cache is None:
-        notes.append("Automatic expert cache is capped at 64 experts per layer.")
+    if vram_budget < free_vram:
+        notes.append("Reserve 2 GiB of free VRAM outside the larger expert-cache plan.")
+    if slots == auto_cache_limit and cache is None:
+        notes.append(f"Automatic expert cache is capped at {slots} experts per layer.")
     return Plan(layout, int(free_vram), int(available_ram), int(slots),
                 "pin" if pinned else "mapped", host_embedding, "cpu", chosen_decoder,
                 "stream" if chosen_decoder == "cuda" else "full",

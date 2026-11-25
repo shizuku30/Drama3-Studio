@@ -67,6 +67,7 @@ from drama_low_vram.gguf_resources import is_gguf, resolve_gguf, inspect_gguf  #
 from drama_low_vram.gguf_runtime import GGUFEngine, GenerationCancelled, MAX_AUTOMATIC_CONTEXT  # noqa: E402
 from drama_low_vram.gguf_workflows import GGUFWorkflows  # noqa: E402
 from drama_low_vram.gguf_takes import load_conditioning_take, save_native_take  # noqa: E402
+from drama_low_vram.voice_disk_cache import studio_voice_cache  # noqa: E402
 from drama_low_vram.runtime_files import load_native_runtime  # noqa: E402
 from drama_low_vram.diagnostics import select_python_device  # noqa: E402
 from drama_low_vram.reference_asr import ReferenceTranscriber  # noqa: E402
@@ -201,12 +202,26 @@ class AppState:
         self._jobs: dict[str, dict] = {}
         self._streams: dict[str, TextStreamSession] = {}
         self._jobs_lock = threading.RLock()
+        self._preview_ready = threading.Condition(self._jobs_lock)
         self._job_persist_times: dict[str, float] = {}
         self._job_clocks: dict[str, JobClock] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drama-ui")
         self._reference_prewarm_lock = threading.RLock()
         self._reference_prewarm_tasks: dict[str, dict] = {}
         self._active_reference_prewarm: str | None = None
+        self._cached_voice_file = self.data_root / "cached-voices.json"
+        self._cached_voice_ids = ()
+        try:
+            ids = json.loads(self._cached_voice_file.read_text(encoding="utf-8"))
+            if isinstance(ids, list):
+                self._cached_voice_ids = tuple(dict.fromkeys(_voice_id(item) for item in ids))
+        except (OSError, ValueError):
+            pass
+        self._voice_cache_fill = None
+        self._voice_cache_refresh = False
+        self._voice_cache_pending = None
+        self._voice_cache_audio = None
+        self._shutting_down = False
         self.asr = ReferenceTranscriber(ROOT, self.data_root, self._executor)
         self.studio = StudioStore(self.data_root)
         self._reference_assets_lock = threading.RLock()
@@ -295,6 +310,7 @@ class AppState:
                 "cross_language": True, "director_revision": advanced, "point_and_scoped_controls": True,
                 "infill": advanced, "audio_import": protocol >= 5,
                 "streaming_text": advanced, "streaming_audio": advanced,
+                "progressive_playback": advanced, "persistent_voice_cache": protocol >= 5,
                 "scene_scheduler": advanced, "native_scene_separator": False,
                 "joint_dialogue": protocol >= 4, "voice_design": protocol >= 4,
                 "direction": True, "language_hint": True, "duration_hint": protocol >= 4,
@@ -596,6 +612,10 @@ class AppState:
                     raise RuntimeError("Finish or cancel generation jobs before switching models")
             if checkpoint != self.checkpoint:
                 self.cancel_reference_prewarm()
+                self._voice_cache_refresh = False
+                self._voice_cache_pending = None
+                if self._voice_cache_fill is not None:
+                    self._voice_cache_fill.set()
                 model_paths = list(dict.fromkeys([checkpoint, self.checkpoint, *self.model_paths]))[:32]
                 temporary = self.settings_file.with_suffix(".tmp")
                 temporary.write_text(json.dumps({
@@ -620,15 +640,24 @@ class AppState:
             status("Model selected: %s", checkpoint.name)
         return self.model_status()
 
-    def release_resources(self):
+    def release_resources(self, *, stop_job=None):
         with self._engine_lock:
             if self._releasing_resources:
                 raise RuntimeError("Model resources are being released. Please wait.")
+            cancel_requested = self.cancel(stop_job) if stop_job is not None else False
             with self._jobs_lock:
-                if any(job["status"] in ("queued", "running") for job in self._jobs.values()):
+                other_jobs = any(identifier != stop_job and job["status"] in ("queued", "running")
+                                 for identifier, job in self._jobs.items())
+            if other_jobs:
+                if stop_job is None:
                     raise RuntimeError("Finish or cancel generation jobs before releasing resources.")
+                return {"id": stop_job, "cancel_requested": cancel_requested,
+                        "resources_released": False, "other_jobs_active": True}
+            # Hold the admission gate until the cancelled worker has unwound and unloaded.
             self._releasing_resources = True
             self.cancel_reference_prewarm()
+            if self._voice_cache_fill is not None:
+                self._voice_cache_fill.set()
             try:
                 future = self._executor.submit(self._release_engine_resources)
             except BaseException:
@@ -639,6 +668,8 @@ class AppState:
         finally:
             with self._engine_lock:
                 self._releasing_resources = False
+        if stop_job is not None:
+            return {"id": stop_job, "cancel_requested": cancel_requested, "resources_released": True}
         return self.model_status()
 
     def _release_engine_resources(self):
@@ -679,14 +710,26 @@ class AppState:
                 result = job.setdefault("result", {"status": "running"})
                 rows = result.setdefault("segments", [])
                 path = event.get("path") or event.get("output")
-                if not any((row.get("path") or row.get("output")) == path for row in rows):
-                    rows.append({key: clone(value) for key, value in event.items() if key not in ("stage", "time")})
+                preview = job.get("preview_audio") and event["stage"] == "audio"
+                is_new = event.get("index") == len(rows) if preview else not any(
+                    (row.get("path") or row.get("output")) == path for row in rows)
+                if is_new:
+                    row = {key: clone(value) for key, value in event.items() if key not in ("stage", "time")}
+                    if preview:
+                        row["produced_at"] = time.monotonic()
+                    rows.append(row)
+            if job.get("preview_audio") and (
+                    event.get("stage") == "audio" or job["status"] not in ("queued", "running")
+                    or job.get("cancel_requested")):
+                self._preview_ready.notify_all()
             job["events"].append({"time": now, **event})
             job["events"] = job["events"][-250:]
             job["updated_at"] = now
             immediate = event.get("stage") in {
                 "error", "complete", "cancel", "cancelled", "segment", "audio",
             }
+            if job.get("preview_audio") and event.get("stage") == "audio":
+                immediate = event.get("index") == 0
             if immediate or now - self._job_persist_times.get(job_id, 0.0) >= 0.75:
                 detail("Job %s: %s", job_id, event)
                 self._persist_job_locked(job_id)
@@ -702,6 +745,9 @@ class AppState:
         if not isinstance(payload, dict):
             raise ValueError("Job payload must be an object")
         payload = clone(payload)
+        preview_requested = payload.pop("preview_audio", False)
+        if type(preview_requested) is not bool:
+            raise ValueError("preview_audio must be a boolean")
         payload = self._creative_request(payload)
         automatic_length = payload.pop("automatic_length", False)
         if not isinstance(automatic_length, bool):
@@ -744,9 +790,12 @@ class AppState:
             payload["max_new_tokens"] = _automatic_generation_limit(payload)
             payload["length_policy"] = "automatic-v1"
             self._validate_sampling(payload)
+        preview_audio = False
         if is_gguf(self.checkpoint):
             self._validate_gguf_job(payload)
             capabilities = self.capabilities()
+            preview_audio = (preview_requested and mode == "tts" and payload.get("scene_strategy") != "joint"
+                             and capabilities.get("progressive_playback", False))
             if ((mode == "design" and not capabilities["voice_design"])
                     or (payload.get("scene_strategy") == "joint"
                         and not capabilities["joint_dialogue"])):
@@ -825,6 +874,7 @@ class AppState:
             "error": None,
             "recipe": recipe,
             "studio": clone(context) if context else None,
+            **({"preview_audio": True} if preview_audio else {}),
             "payload_summary": {
                 "mode": mode,
                 "text_length": _content_width(str(payload.get("text", ""))),
@@ -1061,7 +1111,35 @@ class AppState:
     def save_uploaded_voice(self, payload):
         upload = self.reference_upload(payload["upload_id"])
         path = Path(upload["audio_path"])
-        return self.add_voice(payload["name"], payload["transcript"], 0, path.name, path.read_bytes())
+        return self.add_voice(payload["name"], payload["transcript"], 0, path.name, path.read_bytes(),
+                              direction_preset=payload.get("direction_preset", ""))
+
+    @staticmethod
+    def _direction_preset(value):
+        if not isinstance(value, str) or len(value) > 1000:
+            raise ValueError("Direction preset must be text of at most 1000 characters")
+        return value.strip()
+
+    def update_voice_card(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a voice card object")
+        identifier = _voice_id(payload["voice_id"])
+        name = payload["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Voice name must not be empty")
+        preset = self._direction_preset(payload.get("direction_preset", ""))
+        with self._engine_lock:
+            if identifier in self.studio.removed("voices"):
+                raise ValueError("Voice does not exist")
+            self._voice(identifier)
+            folder = _inside(self.voices_root / identifier, self.voices_root)
+            file = folder / "voice.json"
+            card = json.loads(file.read_text(encoding="utf-8"))
+            card.update(name=name.strip()[:120], direction_preset=preset)
+            temporary = file.with_suffix(".tmp")
+            temporary.write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, file)
+            return self._voice(identifier)
 
     @staticmethod
     def _audio_url(path):
@@ -1078,6 +1156,7 @@ class AppState:
         name = payload.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Voice name must not be empty")
+        preset = self._direction_preset(payload.get("direction_preset", ""))
         bindings = payload.get("references")
         if not isinstance(bindings, list) or not 1 <= len(bindings) <= 32:
             raise ValueError("Choose between 1 and 32 reference clips")
@@ -1108,6 +1187,7 @@ class AppState:
         metadata = {
             "schema": 2, "name": name.strip()[:120], "speaker": 0, "created_at": time.time(),
             "audio": clips[0]["audio"], "transcript": clips[0]["transcript"], "references": clips,
+            **({"direction_preset": preset} if preset else {}),
         }
         (folder / "voice.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1716,6 +1796,34 @@ class AppState:
                 value["timing"] = self._job_clocks[job_id].snapshot()
             return None if value is None else json.loads(json.dumps(value))
 
+    def preview_audio(self, job_id, offset, *, timeout=8.0):
+        record_id(job_id)
+        if offset < 0:
+            raise ValueError("Invalid audio preview cursor")
+        with self._preview_ready:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if not job.get("preview_audio"):
+                return {"parts": [], "status": "unsupported", "done": True}
+
+            def rows():
+                return (job.get("result") or {}).get("segments", ())
+
+            def terminal():
+                return job["status"] not in ("queued", "running") or job.get("cancel_requested")
+
+            self._preview_ready.wait_for(lambda: terminal() or len(rows()) > offset, timeout)
+            if job.get("cancel_requested") or job["status"] == "error":
+                return {"parts": [], "status": "cancelled" if job.get("cancel_requested") else "error", "done": True}
+            parts = [{
+                "url": self._audio_url(_inside(Path(row["path"]), self.jobs_root / job_id)),
+                "index": row["index"], "samples": row["samples"], "sample_rate": row["sample_rate"],
+                "start_sample": row["start_sample"], "produced_at": row["produced_at"],
+            } for row in rows()[offset:offset + 8]]
+            return {"parts": parts, "status": job["status"],
+                    "done": bool(terminal() and offset + len(parts) >= len(rows()))}
+
     def job_page(self, *, before=None):
         if before is not None and (not isinstance(before, (list, tuple)) or len(before) != 2
                                    or not isinstance(before[0], (float, int))
@@ -1815,6 +1923,8 @@ class AppState:
         with self._reference_prewarm_lock:
             audio = [ref.audio for task in self._reference_prewarm_tasks.values()
                      if task["status"] in ("queued", "running") for ref in task["references"]]
+        if self._voice_cache_audio is not None:
+            audio.append(self._voice_cache_audio)
         required.update(filter(None, map(self._asset_owner, audio + self.asr.pending_audio())))
 
         # Follow references from retained results through any removed results they still need.
@@ -1914,12 +2024,17 @@ class AppState:
             job = self._jobs.get(job_id)
             if not job:
                 raise KeyError(job_id)
+            if job["status"] not in ("queued", "running"):
+                return False
+            if job.get("cancel_requested"):
+                return True
             job["cancel_requested"] = True
             stream = self._streams.get(job_id)
             self._persist_job_locked(job_id)
         if stream is not None:
             stream.cancel()
         self._event(job_id, {"stage": "cancel", "message": "Cancellation requested"})
+        return True
 
     def stream_input(self, job_id, *, text=None, finish=False):
         with self._jobs_lock:
@@ -1959,7 +2074,9 @@ class AppState:
                 self._event(job_id, {"stage": "runtime", "message": "Loading the model"})
                 status("Loading model: %s", self.checkpoint.name)
                 if is_gguf(self.checkpoint):
-                    self._engine = GGUFEngine(resolve_gguf(self.checkpoint), root=ROOT)
+                    self._engine = GGUFEngine(
+                        resolve_gguf(self.checkpoint), root=ROOT, voice_library=self.voices_root,
+                        voice_cache_dir=studio_voice_cache(ROOT), auto_cache_limit=int(os.environ.get("DRAMA_GGUF_EXPERT_CACHE_LIMIT", "64")))
                     self._engine.status_callback = lambda event: self._event(
                         job_id, {"stage": "runtime", **event})
                     return self._engine
@@ -2004,7 +2121,89 @@ class AppState:
                 raise ValueError("Reference audio is missing")
             references.append({**item, "audio_path": str(audio), "audio_url": self._audio_url(audio)})
         return {**metadata, "id": voice_id, "audio_path": references[0]["audio_path"],
-                "audio_url": references[0]["audio_url"], "references": references}
+                "audio_url": references[0]["audio_url"], "references": references,
+                "keep_ready": voice_id in self._cached_voice_ids}
+
+    def set_voice_cache(self, voice_id, enabled):
+        _voice_id(voice_id)
+        if type(enabled) is not bool:
+            raise ValueError("Voice cache selection must be a boolean")
+        with self._engine_lock:
+            removed = self.studio.removed("voices")
+            if voice_id in removed:
+                raise ValueError("Voice does not exist")
+            self._voice(voice_id)
+            ids = [item for item in self._cached_voice_ids if item not in removed and
+                   (self.voices_root / item / "voice.json").is_file() and item != voice_id]
+            if enabled:
+                ids.append(voice_id)
+            temporary = self._cached_voice_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps(ids, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(temporary, self._cached_voice_file)
+            self._cached_voice_ids = tuple(ids)
+            if enabled:
+                self._voice_cache_pending = voice_id
+                self._voice_cache_refresh = True
+                self._schedule_voice_cache()
+            return self._voice(voice_id)
+
+    def _schedule_voice_cache(self):
+        with self._engine_lock:
+            engine = self._engine
+            if (self._shutting_down or self._releasing_resources or self._voice_cache_fill is not None
+                    or not self._voice_cache_refresh or self._voice_cache_pending not in self._cached_voice_ids or not getattr(engine, "is_gguf", False)
+                    or not engine.loaded or engine.build.get("protocol", 1) < 5):
+                return
+            with self._jobs_lock:
+                if any(job["status"] in ("queued", "running") for job in self._jobs.values()):
+                    return
+            self._voice_cache_refresh = False
+            self._voice_cache_fill = stopped = threading.Event()
+            self._executor.submit(self._fill_voice_cache, engine, stopped, self._voice_cache_pending)
+
+    def _fill_voice_cache(self, engine, stopped, requested):
+        # This uses the same worker as synthesis. Yield to queued jobs between clips.
+        try:
+            for voice_id in (requested,):
+                if stopped.is_set():
+                    return
+                if voice_id in self.studio.removed("voices"):
+                    continue
+                try:
+                    references = self._references({"voice_bindings": [{"voice_id": voice_id}]})
+                except (OSError, ValueError, KeyError):
+                    continue
+                for reference in references:
+                    with self._engine_lock, self._jobs_lock:
+                        if stopped.is_set() or self._engine is not engine:
+                            return
+                        if not engine.loaded or any(
+                                job["status"] in ("queued", "running") for job in self._jobs.values()):
+                            self._voice_cache_refresh = True
+                            return
+                        if voice_id not in self._cached_voice_ids or voice_id in self.studio.removed("voices"):
+                            break
+                        self._voice_cache_audio = reference.audio
+                    try:
+                        if not engine.references_prepared([reference]):
+                            previous = getattr(engine, "status_callback", None)
+                            engine.status_callback = None
+                            try:
+                                engine.prewarm_references([reference], cancelled=stopped.is_set)
+                            finally:
+                                engine.status_callback = previous
+                    except GenerationCancelled:
+                        return
+                    except (OSError, ValueError, RuntimeError):
+                        detail("Background reference encoding failed for voice %s", voice_id, exc_info=True)
+                    finally:
+                        with self._engine_lock:
+                            self._voice_cache_audio = None
+        finally:
+            with self._engine_lock:
+                self._voice_cache_fill = None
+                if self._voice_cache_refresh:
+                    self._schedule_voice_cache()
 
     def list_voices(self, *, retained=False):
         result = []
@@ -2018,7 +2217,9 @@ class AppState:
                 continue
         return result
 
-    def add_voice(self, name: str, transcript: str, speaker: int, filename: str, data: bytes):
+    def add_voice(self, name: str, transcript: str, speaker: int, filename: str, data: bytes,
+                  *, direction_preset=""):
+        preset = self._direction_preset(direction_preset)
         if len(data) < 32:
             raise ValueError("Audio file is empty")
         VoiceReference("uploaded", str(transcript), int(speaker)).transcript()
@@ -2038,6 +2239,7 @@ class AppState:
             "speaker": int(speaker),
             "audio": audio_name,
             "created_at": time.time(),
+            **({"direction_preset": preset} if preset else {}),
         }
         (folder / "voice.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2491,6 +2693,15 @@ class AppState:
             if protocol < 5:
                 self.cancel_reference_prewarm()
                 return {"status": "unsupported"}
+            if getattr(self._engine, "loaded", False) and self._engine.references_prepared(references):
+                return {"status": "ready"}
+            if self._cached_voice_ids and all(
+                    Path(ref.audio).parent.name in self._cached_voice_ids
+                    and Path(ref.audio).is_relative_to(self.voices_root.resolve()) for ref in references):
+                self._voice_cache_pending = Path(references[0].audio).parent.name
+                self._voice_cache_refresh = True
+                self._schedule_voice_cache()
+                return {"status": "idle"}
         fingerprint = self._reference_prewarm_fingerprint(checkpoint, references)
         with self._reference_prewarm_lock:
             current = self._reference_prewarm_tasks.get(self._active_reference_prewarm)
@@ -2666,6 +2877,7 @@ class AppState:
             self._record_result(job_id, {"status": "cancelled", "output": None, "take_file": None})
             with self._jobs_lock:
                 self._streams.pop(job_id, None)
+            self._schedule_voice_cache()
             return
         with self._jobs_lock:
             self._jobs[job_id]["status"] = "running"
@@ -2695,10 +2907,12 @@ class AppState:
                     clock.end("model_load")
             clock.switch("generation")
             mode = payload.get("mode", "tts")
-            snapshot = self.job(job_id).get("recipe", {}).get("reference_snapshot")
+            current_job = self.job(job_id)
+            snapshot = current_job.get("recipe", {}).get("reference_snapshot")
             references = ([VoiceReference(**item) for item in snapshot] if snapshot is not None
                           else self._references(payload))
-            if first_use and references and mode in ("tts", "audio_stream", "scene"):
+            if (first_use and references and mode in ("tts", "audio_stream", "scene")
+                    and not (native and getattr(engine, "references_prepared", lambda _refs: False)(references))):
                 prepare = (getattr(engine, "prewarm_references", None) if native
                            else getattr(engine, "prewarm_reference_prefix", None))
                 supported = not native or getattr(engine, "build", {}).get("protocol", 1) >= 5
@@ -2855,6 +3069,10 @@ class AppState:
                 kwargs = dict(common)
                 if payload.get("single_chunk"):
                     kwargs["single_chunk"] = True
+                if native and current_job.get("preview_audio"):
+                    kwargs.update(
+                        streaming_audio=not common["silence_retry"], chunk_frames=16,
+                        segment_ready=lambda row: self._event(job_id, {"stage": "audio", **row}))
                 if mode == "infill":
                     for key in (
                         "direction", "language", "duration_frames", "previous_takes",
@@ -2898,6 +3116,7 @@ class AppState:
                     clock.finish()
                     self._jobs[job_id]["timing"] = clock.snapshot()
                     self._persist_job_locked(job_id)
+            self._schedule_voice_cache()
 
     def _record_result(self, job_id, result):
         status = result.get("status", "complete")
@@ -2907,9 +3126,11 @@ class AppState:
             if clock:
                 clock.finish()
                 job["timing"] = clock.snapshot()
-            if "segments" not in result and job.get("result", {}).get("segments"):
-                result = {**result, "segments": job["result"]["segments"],
-                          "take_files": job["result"].get("take_files", [])}
+            published = (job.get("result") or {}).get("segments")
+            if published and job.get("preview_audio"):
+                result = {**result, "segments": published}
+            elif published and "segments" not in result:
+                result = {**result, "segments": published, "take_files": job["result"].get("take_files", [])}
             job["status"] = status
             job["result"] = result
             job["output"] = result.get("output")
@@ -2939,6 +3160,10 @@ class AppState:
     def shutdown(self):
         # Wake live text consumers before waiting for the serialized worker.
         # Otherwise a consumer waiting for lookahead can hold the engine forever.
+        with self._engine_lock:
+            self._shutting_down = True
+            if self._voice_cache_fill is not None:
+                self._voice_cache_fill.set()
         self.cancel_reference_prewarm()
         with self._jobs_lock:
             active = [job_id for job_id, job in self._jobs.items()
@@ -3122,6 +3347,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/jobs":
                 before = parse_qs(parsed.query).get("before", ["null"])[0]
                 return self._json(200, STATE.job_page(before=json.loads(before)))
+            if path.startswith("/api/jobs/") and path.endswith("/preview"):
+                job_id = path.removeprefix("/api/jobs/").removesuffix("/preview")
+                query = parse_qs(parsed.query)
+                preview = STATE.preview_audio(job_id, int(query.get("offset", ["0"])[0]))
+                if preview is None:
+                    return self._json(404, {"error": "Job not found"})
+                try:
+                    return self._json(200, preview)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
             if path.startswith("/api/jobs/"):
                 job_id = path.removeprefix("/api/jobs/")
                 job = STATE.job(job_id)
@@ -3215,6 +3450,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, STATE.crop_reference_upload(self._payload()))
             if path == "/api/reference-audio/from-version":
                 return self._json(201, STATE.reference_from_version(self._payload()))
+            if path == "/api/voices/cache":
+                if self.headers.get_content_type() != "application/json":
+                    return self._json(415, {"error": "Expected a JSON request"})
+                payload = self._payload()
+                if not isinstance(payload, dict):
+                    raise ValueError("Voice cache selection must be an object")
+                return self._json(200, STATE.set_voice_cache(payload.get("voice_id"), payload.get("enabled")))
+            if path == "/api/voices/update":
+                return self._json(200, STATE.update_voice_card(self._payload()))
             if path == "/api/voices/from-upload":
                 return self._json(201, STATE.save_uploaded_voice(self._payload()))
             if path == "/api/voices/from-references":
@@ -3281,6 +3525,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"task": STATE.model_installation.dismiss()})
             if path == "/api/takes/inspect":
                 return self._json(200, STATE.inspect_take(self._payload()["path"]))
+            if path.startswith("/api/jobs/") and path.endswith("/stop-and-release"):
+                job_id = record_id(path.removeprefix("/api/jobs/").removesuffix("/stop-and-release"))
+                self._payload()
+                return self._json(200, STATE.release_resources(stop_job=job_id))
             if path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 job_id = path.removesuffix("/cancel").removeprefix("/api/jobs/")
                 STATE.cancel(job_id)
@@ -3304,12 +3552,14 @@ class Handler(BaseHTTPRequestHandler):
                     audio_field = form["audio"]
                     data = audio_field["data"]
                     filename = audio_field["filename"] or "reference.wav"
+                    preset = form.get("direction_preset", "")
                 else:
                     payload = self._payload()
                     name, transcript = payload["name"], payload["transcript"]
                     speaker, filename = int(payload.get("speaker", 0)), payload.get("filename", "reference.wav")
                     data = base64.b64decode(payload["audio_base64"], validate=True)
-                result = STATE.add_voice(name, transcript, speaker, filename, data)
+                    preset = payload.get("direction_preset", "")
+                result = STATE.add_voice(name, transcript, speaker, filename, data, direction_preset=preset)
                 return self._json(201, result)
             return self._json(404, {"error": "Not found"})
         except KeyError as exc:

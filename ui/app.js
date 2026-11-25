@@ -424,7 +424,9 @@ $('release-resources').onclick = async () => {
 async function loadCapabilities() {
   try {
     const capabilities = await api('/api/capabilities');
+    const voiceCacheChanged = state.capabilities?.persistent_voice_cache !== capabilities.persistent_voice_cache;
     state.capabilities = capabilities;
+    if (voiceCacheChanged && state.voices.length) renderVoices();
     for (const option of $('mode').options) {
       option.disabled = !capabilities[modeCapabilities[option.value]];
     }
@@ -1283,8 +1285,12 @@ function stopVoicePreview() {
   if (auditionButton) renderPreviewButton(auditionButton, false);
   audition = auditionButton = null;
 }
-document.addEventListener('play', event => { if (event.target instanceof HTMLAudioElement) stopVoicePreview(); }, true);
-document.addEventListener('drama:viewchange', stopVoicePreview);
+document.addEventListener('play', event => {
+  if (event.target instanceof HTMLAudioElement) {
+    stopVoicePreview(); window.StudioPreview.stop();
+  }
+}, true);
+document.addEventListener('drama:viewchange', () => { stopVoicePreview(); window.StudioPreview.stop(); });
 function previewVoice(voice, button) {
   const resume = auditionButton === button && audition && button.classList.contains('history-play') && !audition.ended && !audition.error;
   if (auditionButton === button && audition && !audition.paused && !audition.error) {
@@ -1293,6 +1299,7 @@ function previewVoice(voice, button) {
   }
   if (!resume) stopVoicePreview();
   if (!voice?.audio_url) return;
+  window.StudioPreview.stop();
   auditionButton = button;
   const audio = resume ? audition : new Audio(voice.audio_url); audition = audio;
   for (const audio of document.querySelectorAll('audio')) audio.pause();
@@ -1322,7 +1329,8 @@ function renderVoices() {
       `<div class="voice-reference-clip"><p class="voice-transcript">${escapeHtml(clip.transcript)}</p><button class="icon-btn" type="button" data-preview-clip="${escapeHtml(clip.audio_url)}" data-i18n-title="Preview voice" title="${escapeHtml(t('Preview voice'))}" data-i18n-aria-label="Preview voice" aria-label="${escapeHtml(t('Preview voice'))}" aria-pressed="false">${icon('play')}</button><a class="voice-download" download href="${escapeHtml(clip.audio_url)}" data-i18n-title="Download" title="${escapeHtml(t('Download'))}" data-i18n-aria-label="Download" aria-label="${escapeHtml(t('Download'))}">${icon('download')}</a></div>`
     )).join('')}</details>`
   );
-  const markup = state.voices.length ? state.voices.map(voice => (
+  const orderedVoices = [...state.voices].sort((a, b) => Number(!!b.keep_ready) - Number(!!a.keep_ready));
+  const markup = orderedVoices.length ? orderedVoices.map(voice => (
     `<div class="voice-choice"><button class="voice-pick ${state.selectedVoiceIds.has(voice.id) ? 'selected' : ''}" data-voice="${escapeHtml(voice.id)}" aria-pressed="${state.selectedVoiceIds.has(voice.id)}"><span class="voice-pick-icon">${icon('mic')}</span><span class="voice-pick-copy"><b>${escapeHtml(voice.name)}</b><small>${translated('{count} reference clips', { count: voice.references?.length || 1 })}</small></span><span class="voice-pick-check">${icon('check')}</span></button><button class="voice-preview" type="button" data-preview="${escapeHtml(voice.id)}" data-i18n-title="Preview voice" title="${escapeHtml(t('Preview voice'))}" data-i18n-aria-label="Preview voice" aria-label="${escapeHtml(t('Preview voice'))}" aria-pressed="false">${icon('play')}</button></div>`
   )).join('') : `<span class="muted">${translated('No saved voices yet')}</span>`;
   for (const id of ['voice-picks']) {
@@ -1365,7 +1373,39 @@ function renderVoices() {
     remove.title = t('Delete voice'); remove.setAttribute('aria-label', remove.title);
     const trash = ScriptEditor.icon('remove'); trash.classList.add('icon'); remove.append(trash);
     remove.onclick = () => StudioCleanup.open('voices', [id], name, remove);
-    card.querySelector('.voice-card-actions').append(remove);
+    const actions = card.querySelector('.voice-card-actions');
+    if (window.StudioFlow?.editVoiceCard) {
+      const edit = document.createElement('button');
+      edit.type = 'button'; edit.className = 'text-btn';
+      edit.dataset.i18n = 'Edit voice card'; edit.textContent = t(edit.dataset.i18n);
+      edit.onclick = () => StudioFlow.editVoiceCard(voiceById(id));
+      actions.append(edit);
+    }
+    if (state.capabilities?.persistent_voice_cache) {
+      const voice = voiceById(id), pin = document.createElement('button');
+      pin.className = 'text-btn'; pin.type = 'button'; pin.dataset.cacheVoice = id;
+      pin.textContent = t(voice.keep_ready ? 'Kept ready' : 'Keep ready');
+      pin.dataset.i18nTitle = 'Prepare this voice once while the model is loaded.';
+      pin.title = t(pin.dataset.i18nTitle);
+      pin.setAttribute('aria-pressed', String(voice.keep_ready));
+      pin.onclick = async () => {
+        const error = $('voice-cache-error');
+        error.hidden = true; pin.disabled = true;
+        try {
+          const updated = await api('/api/voices/cache', {
+            method: 'POST', body: JSON.stringify({ voice_id: id, enabled: !voice.keep_ready }),
+          });
+          state.voices = state.voices.map(item => item.id === id ? updated : item);
+          renderVoices();
+          [...$('voice-list').querySelectorAll('[data-cache-voice]')]
+            .find(button => button.dataset.cacheVoice === id)?.focus();
+        } catch (failure) {
+          error.textContent = message(failure.message); error.hidden = false;
+        } finally { pin.disabled = false; }
+      };
+      actions.append(pin);
+    }
+    actions.append(remove);
   }
   updateVoiceSelection();
   $('voice-list').querySelectorAll('.use-voice').forEach(button => {
@@ -1529,9 +1569,8 @@ function showWorkspaceResult(name) {
 }
 function renderResults(job, box = $('result-box')) {
   if (box === $('result-box') && resultWorkspaceFor(job) !== state.resultWorkspace) return;
-  const segments = job.result?.segments?.length ? job.result.segments : (job.events || []).filter(event => (
-    ['audio', 'segment'].includes(event.stage) && (event.path || event.output)
-  ));
+  const segments = job.preview_audio ? [] : job.result?.segments?.length ? job.result.segments
+    : (job.events || []).filter(event => ['audio', 'segment'].includes(event.stage) && (event.path || event.output));
   box.classList.toggle('hidden', !job.output && !segments.length);
   if (box.dataset.jobId !== job.id) {
     box.querySelectorAll('audio').forEach(audio => audio.pause());
@@ -1576,6 +1615,18 @@ function renderResults(job, box = $('result-box')) {
   window.StudioFlow?.afterResults(job, box, segments);
   StudioAudio.enhance(box);
 }
+function renderStopAction(job) {
+  const button = $('cancel-job');
+  const active = ['queued', 'running'].includes(job?.status);
+  const stopping = Boolean(job?.id && state.stoppingJobId === job.id);
+  const preview = window.StudioPreview.isActive(job?.id);
+  button.classList.toggle('hidden', !(active || preview || stopping));
+  button.disabled = state.releasingResources || (active && Boolean(job?.cancel_requested));
+  const label = stopping ? 'Stopping and releasing…'
+    : active && job.cancel_requested ? 'Cancelling…' : 'Stop and release';
+  button.dataset.i18n = label;
+  button.textContent = t(label);
+}
 function renderJob(job) {
   if (!job || resultWorkspaceFor(job) === 'editor') return;
   state.resultJobs[resultWorkspaceFor(job)] = job;
@@ -1587,10 +1638,7 @@ function renderJob(job) {
   $('job-badge').dataset.status = job.status;
   $('job-badge').closest('.monitor-panel').dataset.state = job.status;
   const active = ['queued', 'running'].includes(job.status);
-  $('cancel-job').classList.toggle('hidden', !active);
-  $('cancel-job').disabled = Boolean(job.cancel_requested);
-  delete $('cancel-job').dataset.i18n;
-  $('cancel-job').textContent = t(job.cancel_requested ? 'Cancelling…' : 'Cancel');
+  renderStopAction(job);
   const last = (job.events || []).at(-1) || {};
   $('progress-bar').style.width = job.status === 'complete' ? '100%' : active ? '32%' : '0%';
   $('progress-bar').classList.toggle('indeterminate', active);
@@ -1654,7 +1702,24 @@ function monitorJob(id) {
   state.monitoredJobId = id;
   return poll(id);
 }
+function playbackPreviewStatus(value, id) {
+  const live = value === 'buffering' || value === 'playing';
+  $('playback-preview').hidden = !live;
+  if (live) {
+    const label = $('playback-preview-status');
+    label.dataset.i18n = value === 'playing' ? 'Playing preview' : 'Buffering audio';
+    const text = t(label.dataset.i18n);
+    if (label.textContent !== text) label.textContent = text;
+  } else if (value === 'fallback' && state.activeJob?.id === id) {
+    window.StudioFlow?.afterResults(state.activeJob, $('result-box'));
+  }
+  renderStopAction(state.activeJob);
+}
+$('stop-playback-preview').onclick = () => window.StudioPreview.stop();
 $('submit-job').onclick = async () => {
+  window.StudioPreview.stop();
+  const activation = $('autoplay-audio')?.checked && state.capabilities?.progressive_playback
+    && $('mode').value === 'tts' ? window.StudioPreview.arm() : null;
   try {
     state.jobSubmitting = true;
     $('submit-job').disabled = true;
@@ -1666,7 +1731,13 @@ $('submit-job').onclick = async () => {
     else if (payload.mode !== 'infill') {
       payload.uploaded_references = await prepareCloneReference();
     }
+    if (activation && payload.mode === 'tts' && !payload.source_version && payload.scene_strategy !== 'joint')
+      payload.preview_audio = true;
     const job = await api('/api/jobs', { method: 'POST', body: JSON.stringify(payload) });
+    if (payload.preview_audio) {
+      for (const audio of document.querySelectorAll('audio')) audio.pause();
+      window.StudioPreview.follow(job.id, activation, playbackPreviewStatus);
+    }
     window.StudioFlow?.submitted(job.id, payload);
     state.jobs.unshift({ id: job.id, status: 'queued' });
     renderModelPicker();
@@ -1680,14 +1751,33 @@ $('submit-job').onclick = async () => {
   }
 };
 $('cancel-job').onclick = async () => {
-  if (!state.activeJob?.id) return;
-  $('cancel-job').disabled = true;
+  const id = state.activeJob?.id;
+  if (!id || state.releasingResources) return;
+  state.stoppingJobId = id;
+  state.releasingResources = true;
+  clearTimeout(state.pollTimer);
+  window.StudioPreview.release();
+  const resultBox = $('result-box');
+  resultBox.dataset.autoplayJob = id;
+  resultBox.querySelectorAll('audio').forEach(audio => audio.pause());
+  renderStopAction(state.activeJob); renderModelPicker(); window.StudioFlow?.syncControls();
+  document.dispatchEvent(new CustomEvent('drama:resourceschange'));
   try {
-    await api(`/api/jobs/${state.activeJob.id}/cancel`, { method: 'POST' });
-    monitorJob(state.activeJob.id);
+    const stopped = await api(`/api/jobs/${encodeURIComponent(id)}/stop-and-release`, { method: 'POST', body: '{}' });
+    if (stopped.resources_released) state.engineLoaded = false;
+    if (state.monitoredJobId === id) await monitorJob(id);
+    await Promise.all([loadModel(), loadHealth()]);
+    if (stopped.other_jobs_active) {
+      addEvent({ stage: 'error', message: 'Other jobs are still using the model.' });
+    }
   } catch (error) {
+    if (state.monitoredJobId === id) await monitorJob(id);
     addEvent({ stage: 'error', message: error.message });
-    $('cancel-job').disabled = false;
+  } finally {
+    state.stoppingJobId = null;
+    state.releasingResources = false;
+    renderStopAction(state.activeJob); renderModelPicker(); window.StudioFlow?.syncControls();
+    document.dispatchEvent(new CustomEvent('drama:resourceschange'));
   }
 };
 $('push-stream').onclick = async () => {
